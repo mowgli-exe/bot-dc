@@ -1351,6 +1351,7 @@ def get_honeypot(guild_id: int) -> dict:
             "enabled": True,
             "delete_message": True,
             "log": True,
+            "dm_user": True,
         },
     )
     # ensure keys exist for older data
@@ -1360,7 +1361,65 @@ def get_honeypot(guild_id: int) -> dict:
     hp.setdefault("enabled", True)
     hp.setdefault("delete_message", True)
     hp.setdefault("log", True)
+    hp.setdefault("dm_user", True)
     return hp
+
+
+def honeypot_dm_embed(
+    guild: discord.Guild,
+    member: discord.Member,
+    action: str,
+    timeout_minutes: int = 60,
+    channel: discord.abc.GuildChannel | None = None,
+    message_content: str = "",
+) -> discord.Embed:
+    """DM sent to the user before punishment – personalized with mention & examples."""
+    action = action.lower()
+    mention = member.mention  # <@id> – ping-style in DM
+    name = member.display_name
+    ch_name = f"#{channel.name}" if channel else "a restricted channel"
+    preview = (message_content or "").strip()
+    if len(preview) > 120:
+        preview = preview[:117] + "..."
+    if not preview:
+        preview = "*empty message*"
+
+    if action == "ban":
+        title = "You have been banned"
+        what = f"**banned** from **{guild.name}**"
+        color = discord.Color.dark_red()
+    elif action == "kick":
+        title = "You have been kicked"
+        what = f"**kicked** from **{guild.name}**"
+        color = discord.Color.orange()
+    else:
+        title = "You have been timed out"
+        what = (
+            f"**timed out** on **{guild.name}** "
+            f"for **{timeout_minutes} minutes**"
+        )
+        color = discord.Color.gold()
+
+    desc = (
+        f"Hey {mention} (**{name}**),\n\n"
+        f"You were {what}.\n\n"
+        f"**Why?**\n"
+        f"You posted in a honeypot / restricted channel (`{ch_name}`).\n"
+        f"These channels are traps for spam bots and raiders.\n\n"
+        f"**Your message:**\n"
+        f"> {preview}\n\n"
+        f"**Examples of what triggers this:**\n"
+        f"• Writing anything in `{ch_name}`\n"
+        f"• Spam / raid messages in trap channels\n"
+        f"• Bots posting in decoy channels like `#free-nitro`\n\n"
+        f"If you think this was a mistake, contact a server admin."
+    )
+
+    embed = discord.Embed(title=f"🍯 {title}", description=desc, color=color)
+    embed.set_footer(text=f"{guild.name} • Honeypot system")
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    return embed
 
 
 async def check_honeypot(message: discord.Message) -> bool:
@@ -1382,6 +1441,7 @@ async def check_honeypot(message: discord.Message) -> bool:
     member = message.author
     action = hp.get("action", "ban")
     reason = "Honeypot triggered"
+    mins = int(hp.get("timeout_minutes", 60))
 
     # Delete the bait message
     if hp.get("delete_message", True):
@@ -1389,6 +1449,25 @@ async def check_honeypot(message: discord.Message) -> bool:
             await message.delete()
         except (discord.Forbidden, discord.NotFound):
             pass
+
+    # DM the user BEFORE ban/kick (after that they may not receive it)
+    dm_sent = False
+    if hp.get("dm_user", True):
+        try:
+            await member.send(
+                content=member.mention,  # ping the user in the DM
+                embed=honeypot_dm_embed(
+                    message.guild,
+                    member,
+                    action,
+                    mins,
+                    channel=message.channel,
+                    message_content=message.content or "",
+                ),
+            )
+            dm_sent = True
+        except (discord.Forbidden, discord.HTTPException):
+            dm_sent = False
 
     # Log
     if hp.get("log", True):
@@ -1408,6 +1487,11 @@ async def check_honeypot(message: discord.Message) -> bool:
             embed.add_field(name="Channel", value=message.channel.mention, inline=True)
             embed.add_field(name="Action", value=action.upper(), inline=True)
             embed.add_field(
+                name="DM sent",
+                value="✅ Yes" if dm_sent else "❌ No (DMs closed / blocked)",
+                inline=True,
+            )
+            embed.add_field(
                 name="Message",
                 value=(message.content or "*empty*")[:500],
                 inline=False,
@@ -1424,10 +1508,8 @@ async def check_honeypot(message: discord.Message) -> bool:
         elif action == "kick":
             await member.kick(reason=reason)
         else:  # timeout
-            mins = int(hp.get("timeout_minutes", 60))
             await member.timeout(timedelta(minutes=mins), reason=reason)
     except discord.Forbidden:
-        # Can't punish – still count as handled
         pass
     except discord.HTTPException:
         pass
@@ -1435,38 +1517,88 @@ async def check_honeypot(message: discord.Message) -> bool:
     return True
 
 
+# ----------------------------------------------------------------------------
+# AUTO-RESPONSES (keyword triggers)
+# ----------------------------------------------------------------------------
+
+def get_autoresponses(guild_id: int) -> list:
+    """List of {keyword, response, enabled}."""
+    cfg = guild_settings(guild_id)
+    if "autoresponses" not in cfg:
+        cfg["autoresponses"] = []
+        save()
+    return cfg["autoresponses"]
+
+
+async def check_autoresponse(message: discord.Message) -> bool:
+    """Reply if a keyword matches. Returns True if replied."""
+    if message.author.bot or not message.guild:
+        return False
+    content = (message.content or "").lower()
+    if not content:
+        return False
+    for entry in get_autoresponses(message.guild.id):
+        if not entry.get("enabled", True):
+            continue
+        kw = (entry.get("keyword") or "").lower().strip()
+        if not kw:
+            continue
+        # match as whole word or substring depending on spaces
+        if kw in content:
+            resp = entry.get("response") or ""
+            if not resp:
+                continue
+            # simple placeholders
+            resp = (
+                resp.replace("{user}", message.author.mention)
+                .replace("{username}", message.author.display_name)
+                .replace("{server}", message.guild.name)
+            )
+            try:
+                await message.channel.send(resp)
+            except discord.Forbidden:
+                return False
+            return True
+    return False
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
-    if message.author.guild_permissions.manage_messages:
-        return
 
-    # Honeypot first – highest priority
+    is_staff = message.author.guild_permissions.manage_messages
+
+    # Honeypot first – highest priority (staff immune inside check)
     if await check_honeypot(message):
         return
 
-    # Order: Links → Caps → Word filter → Spam
-    if await check_links(message):
-        return
-    if await check_caps(message):
-        return
-    if await check_filter(message):
-        return
+    if not is_staff:
+        # Order: Links → Caps → Word filter → Spam
+        if await check_links(message):
+            return
+        if await check_caps(message):
+            return
+        if await check_filter(message):
+            return
 
-    times = recent[(message.guild.id, message.author.id)]
-    now = time.time()
-    times.append(now)
-    if len(times) == 5 and now - times[0] < 5:
-        times.clear()
-        try:
-            await message.author.timeout(timedelta(minutes=5), reason="Spam")
-            await message.channel.send(
-                f"🔇 {message.author.mention} has been timed out for 5 minutes due to spam.",
-                delete_after=10,
-            )
-        except discord.Forbidden:
-            pass
+        times = recent[(message.guild.id, message.author.id)]
+        now = time.time()
+        times.append(now)
+        if len(times) == 5 and now - times[0] < 5:
+            times.clear()
+            try:
+                await message.author.timeout(timedelta(minutes=5), reason="Spam")
+                await message.channel.send(
+                    f"🔇 {message.author.mention} has been timed out for 5 minutes due to spam.",
+                    delete_after=10,
+                )
+            except discord.Forbidden:
+                pass
+            return
+
+    # Keyword auto-replies (everyone, including staff)
+    await check_autoresponse(message)
 
 
 @bot.event
@@ -1497,70 +1629,29 @@ def main_dashboard_embed(guild: discord.Guild) -> discord.Embed:
         if guild.get_channel(int(cid)) is not None
     )
     banned = get_banned_words(guild.id)
-    warn_count = sum(
-        len(v)
-        for gid, users in data.get("warns", {}).items()
-        if str(gid) == str(guild.id)
-        for v in users.values()
-    )
     hp = get_honeypot(guild.id)
-    hp_channels = hp.get("channel_ids", [])
+    ar = get_autoresponses(guild.id)
 
     embed = discord.Embed(
         title="⚙️ Admin Dashboard",
-        description=(
-            f"Server: **{guild.name}**\n"
-            "Control everything with the buttons below."
-        ),
+        description=f"**{guild.name}**\nChoose a module from the menu below.",
         color=discord.Color.blurple(),
     )
     embed.add_field(
-        name="🎉 Giveaways",
-        value=f"**{len(active_gw)}** active",
-        inline=True,
-    )
-    embed.add_field(
-        name="🎫 Tickets",
-        value=f"**{open_tickets}** open",
-        inline=True,
-    )
-    embed.add_field(
-        name="⚠️ Warnings",
-        value=f"**{warn_count}** total",
-        inline=True,
-    )
-    embed.add_field(
-        name="🍯 Honeypot",
+        name="Overview",
         value=(
-            f"{'✅ ON' if hp.get('enabled') else '❌ OFF'} · "
-            f"**{len(hp_channels)}** channel(s) · "
-            f"Action: **{hp.get('action', 'ban').upper()}**"
+            f"🎉 Giveaways **{len(active_gw)}** · "
+            f"🎫 Tickets **{open_tickets}** · "
+            f"🍯 Honeypot **{len(hp.get('channel_ids', []))}** ch\n"
+            f"🛡️ Link `{'on' if cfg.get('anti_link') else 'off'}` · "
+            f"Invite `{'on' if cfg.get('anti_invite') else 'off'}` · "
+            f"Caps `{'on' if cfg.get('anti_caps') else 'off'}`\n"
+            f"🔤 Banned words **{len(banned)}** · "
+            f"💬 Auto-replies **{len(ar)}**"
         ),
         inline=False,
     )
-    embed.add_field(
-        name="🛡️ Auto-Mod",
-        value=(
-            f"Link: {'✅' if cfg.get('anti_link') else '❌'} · "
-            f"Invite: {'✅' if cfg.get('anti_invite') else '❌'} · "
-            f"Caps: {'✅' if cfg.get('anti_caps') else '❌'}\n"
-            f"Banned words: **{len(banned)}**"
-        ),
-        inline=False,
-    )
-    log_id = guild_settings(guild.id).get("log_channel")
-    cat_id = guild_settings(guild.id).get("category")
-    role_id = guild_settings(guild.id).get("support_role")
-    embed.add_field(
-        name="📌 Setup",
-        value=(
-            f"Log channel: {f'<#{log_id}>' if log_id else '—'}\n"
-            f"Ticket category: {f'<#{cat_id}>' if cat_id else '—'}\n"
-            f"Support role: {f'<@&{role_id}>' if role_id else '—'}"
-        ),
-        inline=False,
-    )
-    embed.set_footer(text="Manage Server permission required · Panel expires after 3 min")
+    embed.set_footer(text="Select a module · Panel expires after 3 min")
     return embed
 
 
@@ -1638,144 +1729,216 @@ class DomainAddModal(discord.ui.Modal, title="Allow Domain"):
         )
 
 
+async def _open_tickets_panel(interaction: discord.Interaction):
+    cfg = guild_settings(interaction.guild.id)
+    open_t = [
+        (cid, uid)
+        for cid, uid in data["tickets"].items()
+        if interaction.guild.get_channel(int(cid))
+    ]
+    embed = discord.Embed(title="🎫 Tickets", color=discord.Color.green())
+    embed.add_field(name="Open", value=str(len(open_t)), inline=True)
+    embed.add_field(
+        name="Category",
+        value=f"<#{cfg['category']}>" if cfg.get("category") else "Not set",
+        inline=True,
+    )
+    embed.add_field(
+        name="Support role",
+        value=f"<@&{cfg['support_role']}>" if cfg.get("support_role") else "Not set",
+        inline=True,
+    )
+    embed.add_field(
+        name="Log channel",
+        value=f"<#{cfg['log_channel']}>" if cfg.get("log_channel") else "Not set",
+        inline=True,
+    )
+    if open_t:
+        lines = [f"<#{cid}> — <@{uid}>" for cid, uid in open_t[:12]]
+        embed.add_field(name="Current", value="\n".join(lines), inline=False)
+    embed.set_footer(text="Use /ticket_setup to place the panel")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def autoresponse_panel_embed(guild: discord.Guild) -> discord.Embed:
+    entries = get_autoresponses(guild.id)
+    embed = discord.Embed(
+        title="💬 Auto-Replies",
+        description=(
+            "When someone writes a **keyword**, the bot replies automatically.\n"
+            "Placeholders: `{user}` `{username}` `{server}`"
+        ),
+        color=discord.Color.teal(),
+    )
+    if not entries:
+        embed.add_field(name="Entries", value="*None yet – add one below*", inline=False)
+    else:
+        lines = []
+        for i, e in enumerate(entries[:20], 1):
+            status = "✅" if e.get("enabled", True) else "❌"
+            kw = e.get("keyword", "?")
+            resp = (e.get("response") or "")[:60]
+            lines.append(f"{status} **{i}.** `{kw}` → {resp}")
+        embed.add_field(name=f"Entries ({len(entries)})", value="\n".join(lines), inline=False)
+    return embed
+
+
+class AutoResponseAddModal(discord.ui.Modal, title="Add Auto-Reply"):
+    keyword = discord.ui.TextInput(
+        label="Keyword",
+        placeholder="e.g. download",
+        max_length=80,
+        required=True,
+    )
+    response = discord.ui.TextInput(
+        label="Response",
+        placeholder="e.g. Download here: https://example.com  |  use {user}",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        kw = self.keyword.value.strip()
+        resp = self.response.value.strip()
+        entries = get_autoresponses(interaction.guild.id)
+        if any(e.get("keyword", "").lower() == kw.lower() for e in entries):
+            return await interaction.response.send_message(
+                "This keyword already exists.", ephemeral=True
+            )
+        entries.append({"keyword": kw, "response": resp, "enabled": True})
+        save()
+        await interaction.response.send_message(
+            f"✅ Auto-reply for `{kw}` added.", ephemeral=True
+        )
+
+
+class AutoResponseRemoveModal(discord.ui.Modal, title="Remove Auto-Reply"):
+    keyword = discord.ui.TextInput(
+        label="Keyword to remove",
+        placeholder="Exact keyword",
+        max_length=80,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        kw = self.keyword.value.strip().lower()
+        entries = get_autoresponses(interaction.guild.id)
+        before = len(entries)
+        entries[:] = [e for e in entries if e.get("keyword", "").lower() != kw]
+        save()
+        if len(entries) == before:
+            return await interaction.response.send_message(
+                "Keyword not found.", ephemeral=True
+            )
+        await interaction.response.send_message(
+            f"✅ Removed `{kw}`.", ephemeral=True
+        )
+
+
+class AutoResponsePanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="Add", emoji="➕", style=discord.ButtonStyle.green, row=0)
+    async def btn_add(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AutoResponseAddModal())
+
+    @discord.ui.button(label="Remove", emoji="➖", style=discord.ButtonStyle.red, row=0)
+    async def btn_remove(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AutoResponseRemoveModal())
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.grey, row=0)
+    async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=autoresponse_panel_embed(interaction.guild),
+            view=AutoResponsePanelView(),
+        )
+
+    @discord.ui.button(label="Back", emoji="⬅️", style=discord.ButtonStyle.grey, row=1)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=main_dashboard_embed(interaction.guild),
+            view=AdminDashboardView(interaction.guild.id),
+        )
+
+
+class DashboardNavSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Giveaways", emoji="🎉", value="giveaways", description="Start, end, reroll"),
+            discord.SelectOption(label="Honeypot", emoji="🍯", value="honeypot", description="Trap channels"),
+            discord.SelectOption(label="Auto-Mod", emoji="🛡️", value="automod", description="Link, invite, caps"),
+            discord.SelectOption(label="Word Filter", emoji="🔤", value="filter", description="Banned words"),
+            discord.SelectOption(label="Auto-Replies", emoji="💬", value="autoresponse", description="Keyword responses"),
+            discord.SelectOption(label="Tickets", emoji="🎫", value="tickets", description="Ticket status"),
+        ]
+        super().__init__(
+            placeholder="Open a module…",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        if choice == "giveaways":
+            await interaction.response.send_message(
+                embed=dashboard_embed(interaction.guild),
+                view=GiveawayDashboardView(interaction.guild.id),
+                ephemeral=True,
+            )
+        elif choice == "honeypot":
+            await interaction.response.send_message(
+                embed=honeypot_panel_embed(interaction.guild),
+                view=HoneypotPanelView(interaction.guild),
+                ephemeral=True,
+            )
+        elif choice == "automod":
+            await interaction.response.send_message(
+                embed=automod_panel_embed(interaction.guild),
+                view=AutoModPanelView(interaction.guild.id),
+                ephemeral=True,
+            )
+        elif choice == "filter":
+            words = get_banned_words(interaction.guild.id)
+            text = ", ".join(f"`{w}`" for w in words[:40]) or "None"
+            if len(words) > 40:
+                text += f" … (+{len(words) - 40})"
+            embed = discord.Embed(
+                title="🔤 Banned Words",
+                description=text,
+                color=discord.Color.orange(),
+            )
+            embed.set_footer(text=f"{len(words)} words total")
+            await interaction.response.send_message(
+                embed=embed, view=FilterPanelView(), ephemeral=True
+            )
+        elif choice == "autoresponse":
+            await interaction.response.send_message(
+                embed=autoresponse_panel_embed(interaction.guild),
+                view=AutoResponsePanelView(),
+                ephemeral=True,
+            )
+        elif choice == "tickets":
+            await _open_tickets_panel(interaction)
+
+
 class AdminDashboardView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=180)
         self.guild_id = guild_id
+        self.add_item(DashboardNavSelect())
 
-    # ---- Row 0: Modules ----
-    @discord.ui.button(label="Giveaways", emoji="🎉", style=discord.ButtonStyle.primary, row=0)
-    async def btn_giveaways(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            embed=dashboard_embed(interaction.guild),
-            view=GiveawayDashboardView(interaction.guild.id),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Honeypot", emoji="🍯", style=discord.ButtonStyle.primary, row=0)
-    async def btn_honeypot(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            embed=honeypot_panel_embed(interaction.guild),
-            view=HoneypotPanelView(interaction.guild),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Auto-Mod", emoji="🛡️", style=discord.ButtonStyle.primary, row=0)
-    async def btn_automod(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = AutoModPanelView(interaction.guild.id)
-        await interaction.response.send_message(
-            embed=automod_panel_embed(interaction.guild),
-            view=view,
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Filter", emoji="🔤", style=discord.ButtonStyle.primary, row=0)
-    async def btn_filter(self, interaction: discord.Interaction, button: discord.ui.Button):
-        words = get_banned_words(interaction.guild.id)
-        text = ", ".join(f"`{w}`" for w in words[:40]) or "None"
-        if len(words) > 40:
-            text += f" … (+{len(words) - 40})"
-        embed = discord.Embed(
-            title="🔤 Banned Words",
-            description=text,
-            color=discord.Color.orange(),
-        )
-        embed.set_footer(text=f"{len(words)} words total")
-        await interaction.response.send_message(
-            embed=embed, view=FilterPanelView(), ephemeral=True
-        )
-
-    @discord.ui.button(label="Tickets", emoji="🎫", style=discord.ButtonStyle.primary, row=1)
-    async def btn_tickets(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cfg = guild_settings(interaction.guild.id)
-        open_t = [
-            (cid, uid)
-            for cid, uid in data["tickets"].items()
-            if interaction.guild.get_channel(int(cid))
-        ]
-        embed = discord.Embed(title="🎫 Tickets", color=discord.Color.green())
-        embed.add_field(
-            name="Open tickets",
-            value=str(len(open_t)) or "0",
-            inline=True,
-        )
-        embed.add_field(
-            name="Category",
-            value=f"<#{cfg['category']}>" if cfg.get("category") else "Not set",
-            inline=True,
-        )
-        embed.add_field(
-            name="Support role",
-            value=f"<@&{cfg['support_role']}>" if cfg.get("support_role") else "Not set",
-            inline=True,
-        )
-        embed.add_field(
-            name="Log channel",
-            value=f"<#{cfg['log_channel']}>" if cfg.get("log_channel") else "Not set",
-            inline=True,
-        )
-        if open_t:
-            lines = [f"<#{cid}> — <@{uid}>" for cid, uid in open_t[:15]]
-            embed.add_field(
-                name="Current tickets",
-                value="\n".join(lines),
-                inline=False,
-            )
-        embed.set_footer(text="Use /ticket_setup to configure the panel")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ---- Row 1/2: Quick toggles ----
-    @discord.ui.button(label="Toggle Link", emoji="🔗", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_toggle_link(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cfg = get_automod_settings(interaction.guild.id)
-        cfg["anti_link"] = not cfg.get("anti_link", True)
-        save()
-        state = "ON" if cfg["anti_link"] else "OFF"
-        await interaction.response.send_message(
-            f"Anti-Link is now **{state}**.", ephemeral=True
-        )
-        try:
-            await interaction.message.edit(embed=main_dashboard_embed(interaction.guild))
-        except Exception:
-            pass
-
-    @discord.ui.button(label="Toggle Invite", emoji="📨", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_toggle_invite(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cfg = get_automod_settings(interaction.guild.id)
-        cfg["anti_invite"] = not cfg.get("anti_invite", True)
-        save()
-        state = "ON" if cfg["anti_invite"] else "OFF"
-        await interaction.response.send_message(
-            f"Anti-Invite is now **{state}**.", ephemeral=True
-        )
-        try:
-            await interaction.message.edit(embed=main_dashboard_embed(interaction.guild))
-        except Exception:
-            pass
-
-    @discord.ui.button(label="Toggle Caps", emoji="🔠", style=discord.ButtonStyle.secondary, row=2)
-    async def btn_toggle_caps(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cfg = get_automod_settings(interaction.guild.id)
-        cfg["anti_caps"] = not cfg.get("anti_caps", True)
-        save()
-        state = "ON" if cfg["anti_caps"] else "OFF"
-        await interaction.response.send_message(
-            f"Anti-Caps is now **{state}**.", ephemeral=True
-        )
-        try:
-            await interaction.message.edit(embed=main_dashboard_embed(interaction.guild))
-        except Exception:
-            pass
-
-    # ---- Row 2: Utility ----
-    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.grey, row=2)
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.grey, row=1)
     async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=main_dashboard_embed(interaction.guild),
             view=AdminDashboardView(interaction.guild.id),
         )
 
-    @discord.ui.button(label="Close", emoji="✖️", style=discord.ButtonStyle.red, row=2)
+    @discord.ui.button(label="Close", emoji="✖️", style=discord.ButtonStyle.red, row=1)
     async def btn_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             content="Dashboard closed.", embed=None, view=None
@@ -1807,6 +1970,11 @@ def honeypot_panel_embed(guild: discord.Guild) -> discord.Embed:
         value=f"**{hp.get('action', 'ban').upper()}**",
         inline=True,
     )
+    embed.add_field(
+        name="DM User",
+        value="✅ ON" if hp.get("dm_user", True) else "❌ OFF",
+        inline=True,
+    )
     if hp.get("action") == "timeout":
         embed.add_field(
             name="Timeout",
@@ -1818,7 +1986,7 @@ def honeypot_panel_embed(guild: discord.Guild) -> discord.Embed:
         value=ch_text,
         inline=False,
     )
-    embed.set_footer(text="Staff with Manage Messages are immune")
+    embed.set_footer(text="Staff with Manage Messages are immune · DM is sent before ban/kick")
     return embed
 
 
@@ -1873,6 +2041,16 @@ class HoneypotPanelView(discord.ui.View):
             view=HoneypotPanelView(interaction.guild),
         )
 
+    @discord.ui.button(label="DM ON/OFF", emoji="✉️", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_dm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        hp = get_honeypot(interaction.guild.id)
+        hp["dm_user"] = not hp.get("dm_user", True)
+        save()
+        await interaction.response.edit_message(
+            embed=honeypot_panel_embed(interaction.guild),
+            view=HoneypotPanelView(interaction.guild),
+        )
+
     @discord.ui.button(label="Action: Ban", emoji="🔨", style=discord.ButtonStyle.danger, row=1)
     async def btn_ban(self, interaction: discord.Interaction, button: discord.ui.Button):
         hp = get_honeypot(interaction.guild.id)
@@ -1883,7 +2061,7 @@ class HoneypotPanelView(discord.ui.View):
             view=HoneypotPanelView(interaction.guild),
         )
 
-    @discord.ui.button(label="Action: Kick", emoji="👢", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Action: Kick", emoji="👢", style=discord.ButtonStyle.secondary, row=2)
     async def btn_kick(self, interaction: discord.Interaction, button: discord.ui.Button):
         hp = get_honeypot(interaction.guild.id)
         hp["action"] = "kick"
@@ -1913,7 +2091,7 @@ class HoneypotPanelView(discord.ui.View):
             view=HoneypotPanelView(interaction.guild),
         )
 
-    @discord.ui.button(label="Back", emoji="⬅️", style=discord.ButtonStyle.grey, row=2)
+    @discord.ui.button(label="Back", emoji="⬅️", style=discord.ButtonStyle.grey, row=3)
     async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=main_dashboard_embed(interaction.guild),
