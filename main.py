@@ -1530,8 +1530,17 @@ def get_autoresponses(guild_id: int) -> list:
     return cfg["autoresponses"]
 
 
+def _apply_ar_placeholders(text: str, message: discord.Message) -> str:
+    return (
+        (text or "")
+        .replace("{user}", message.author.mention)
+        .replace("{username}", message.author.display_name)
+        .replace("{server}", message.guild.name)
+    )
+
+
 async def check_autoresponse(message: discord.Message) -> bool:
-    """Reply if a keyword matches. Returns True if replied."""
+    """Reply with an embed if a keyword matches. Returns True if replied."""
     if message.author.bot or not message.guild:
         return False
     content = (message.content or "").lower()
@@ -1541,24 +1550,32 @@ async def check_autoresponse(message: discord.Message) -> bool:
         if not entry.get("enabled", True):
             continue
         kw = (entry.get("keyword") or "").lower().strip()
-        if not kw:
+        if not kw or kw not in content:
             continue
-        # match as whole word or substring depending on spaces
-        if kw in content:
-            resp = entry.get("response") or ""
-            if not resp:
-                continue
-            # simple placeholders
-            resp = (
-                resp.replace("{user}", message.author.mention)
-                .replace("{username}", message.author.display_name)
-                .replace("{server}", message.guild.name)
+        body = _apply_ar_placeholders(entry.get("response") or "", message)
+        if not body:
+            continue
+        title = _apply_ar_placeholders(
+            entry.get("title") or f"Info · {entry.get('keyword', 'Reply')}",
+            message,
+        )
+        embed = discord.Embed(
+            title=title[:256],
+            description=body[:4096],
+            color=discord.Color.teal(),
+        )
+        embed.set_footer(text=message.guild.name)
+        if message.guild.icon:
+            embed.set_thumbnail(url=message.guild.icon.url)
+        try:
+            # Mention user outside embed so they get notified
+            await message.channel.send(
+                content=message.author.mention,
+                embed=embed,
             )
-            try:
-                await message.channel.send(resp)
-            except discord.Forbidden:
-                return False
-            return True
+        except discord.Forbidden:
+            return False
+        return True
     return False
 
 
@@ -1765,7 +1782,7 @@ def autoresponse_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(
         title="💬 Auto-Replies",
         description=(
-            "When someone writes a **keyword**, the bot replies automatically.\n"
+            "When someone writes a **keyword**, the bot replies with an **embed**.\n"
             "Placeholders: `{user}` `{username}` `{server}`"
         ),
         color=discord.Color.teal(),
@@ -1777,8 +1794,8 @@ def autoresponse_panel_embed(guild: discord.Guild) -> discord.Embed:
         for i, e in enumerate(entries[:20], 1):
             status = "✅" if e.get("enabled", True) else "❌"
             kw = e.get("keyword", "?")
-            resp = (e.get("response") or "")[:60]
-            lines.append(f"{status} **{i}.** `{kw}` → {resp}")
+            title = (e.get("title") or "Info")[:40]
+            lines.append(f"{status} **{i}.** `{kw}` → *{title}*")
         embed.add_field(name=f"Entries ({len(entries)})", value="\n".join(lines), inline=False)
     return embed
 
@@ -1790,9 +1807,16 @@ class AutoResponseAddModal(discord.ui.Modal, title="Add Auto-Reply"):
         max_length=80,
         required=True,
     )
+    title = discord.ui.TextInput(
+        label="Embed title",
+        placeholder="e.g. Download Link",
+        max_length=100,
+        required=False,
+        default="Info",
+    )
     response = discord.ui.TextInput(
-        label="Response",
-        placeholder="e.g. Download here: https://example.com  |  use {user}",
+        label="Embed description",
+        placeholder="e.g. Hey {user}, download here: https://example.com",
         style=discord.TextStyle.paragraph,
         max_length=1000,
         required=True,
@@ -1800,16 +1824,24 @@ class AutoResponseAddModal(discord.ui.Modal, title="Add Auto-Reply"):
 
     async def on_submit(self, interaction: discord.Interaction):
         kw = self.keyword.value.strip()
+        title = (self.title.value or "Info").strip()
         resp = self.response.value.strip()
         entries = get_autoresponses(interaction.guild.id)
         if any(e.get("keyword", "").lower() == kw.lower() for e in entries):
             return await interaction.response.send_message(
                 "This keyword already exists.", ephemeral=True
             )
-        entries.append({"keyword": kw, "response": resp, "enabled": True})
+        entries.append(
+            {
+                "keyword": kw,
+                "title": title,
+                "response": resp,
+                "enabled": True,
+            }
+        )
         save()
         await interaction.response.send_message(
-            f"✅ Auto-reply for `{kw}` added.", ephemeral=True
+            f"✅ Auto-reply embed for `{kw}` added.", ephemeral=True
         )
 
 
